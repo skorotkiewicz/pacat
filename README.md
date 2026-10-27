@@ -10,7 +10,7 @@ The list uses the same discovery as Rudo's application picker: `gio::AppInfo::al
 
 Select an application to see its uninstall command. The Copy command button copies the text to your clipboard. Pacat never executes uninstall commands.
 
-Pacman, Debian and RPM package ownership is detected using read-only queries on the desktop file. Flatpak and Snap applications are recognized through desktop-entry metadata. Applications without a known package owner stay in the list and show that an uninstall command could not be found.
+Pacman, Debian and RPM package ownership is detected using read-only queries on the desktop file, then the application's executable and resolved symlink target. Flatpak and Snap applications are recognized through desktop-entry metadata. Wine applications show `wine uninstaller` with the launcher's `WINEPREFIX`, so you can select the Windows application to remove. Applications without a known uninstall command stay in the list and show that the command could not be determined.
 
 Requires Linux, GTK 4 development libraries, and Rust.
 

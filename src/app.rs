@@ -154,7 +154,8 @@ fn build_window(application: &gtk::Application) {
                 selected_copy.set_sensitive(true);
             }
             None => {
-                selected_command.set_text("No package manager owns this application. It may have been installed manually.");
+                selected_command
+                    .set_text("Could not determine an uninstall command for this application.");
                 selected_copy.set_sensitive(false);
             }
         }
