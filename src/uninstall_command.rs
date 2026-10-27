@@ -422,7 +422,6 @@ mod tests {
         root: PathBuf,
         executable: PathBuf,
         launcher: PathBuf,
-        bundled_launcher: PathBuf,
     }
 
     impl TestBundle {
@@ -436,8 +435,7 @@ mod tests {
             let bundle = root.join("Example App.app");
             let executable = bundle.join("bin/example");
             let launcher = root.join("applications/org.example.App.desktop");
-            let bundled_launcher = bundle.join("share/applications/org.example.App.desktop");
-            for file in [&executable, &launcher, &bundled_launcher] {
+            for file in [&executable, &launcher] {
                 fs::create_dir_all(file.parent().expect("fixture parent"))
                     .expect("create fixture directory");
             }
@@ -449,12 +447,10 @@ mod tests {
                 executable.display()
             );
             fs::write(&launcher, &contents).expect("create launcher");
-            fs::write(&bundled_launcher, contents).expect("create bundled launcher");
             Self {
                 root,
                 executable,
                 launcher,
-                bundled_launcher,
             }
         }
 

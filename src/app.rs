@@ -18,7 +18,7 @@ pub(crate) fn main() -> glib::ExitCode {
     application.run()
 }
 
-// Match Rudo's application picker: visible desktop apps, sorted by display name.
+// Visible desktop apps, sorted by display name.
 fn load_apps() -> Vec<gio::AppInfo> {
     let mut apps: Vec<_> = gio::AppInfo::all()
         .into_iter()
