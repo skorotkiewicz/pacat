@@ -14,6 +14,8 @@ Pacman, Debian and RPM package ownership is detected using read-only queries on 
 
 Requires Linux, GTK 4 development libraries, and Rust.
 
+Steam games show a `steam://uninstall/APPID` command for Steam's uninstall dialog. These commands are displayed only.
+
 ```sh
 just check
 just test

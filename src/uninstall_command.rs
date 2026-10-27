@@ -26,6 +26,11 @@ fn for_app_with_owner(
         .commandline()
         .and_then(|command| Launch::parse(&command));
     if let Some(launch) = &launch
+        && let Some(command) = launch.steam_uninstall()
+    {
+        return Some(command);
+    }
+    if let Some(launch) = &launch
         && matches!(launch.executable.file_name()?.to_str()?, "wine" | "wine64")
     {
         let wine = shell_quote(launch.executable.to_str()?);
@@ -77,6 +82,7 @@ fn lookup_path(path: &Path, owner: &mut impl FnMut(&Path) -> Option<String>) -> 
 struct Launch {
     executable: PathBuf,
     wine_prefix: Option<OsString>,
+    arguments: Vec<OsString>,
 }
 
 impl Launch {
@@ -114,7 +120,36 @@ impl Launch {
         Some(Self {
             executable: PathBuf::from(args.get(index)?),
             wine_prefix,
+            arguments: args[index + 1..].to_vec(),
         })
+    }
+
+    fn steam_uninstall(&self) -> Option<String> {
+        if self.executable.file_name()? != "steam" {
+            return None;
+        }
+        let id = self
+            .arguments
+            .iter()
+            .find_map(|argument| {
+                let argument = argument.to_str()?;
+                argument
+                    .strip_prefix("steam://rungameid/")
+                    .or_else(|| argument.strip_prefix("steam://run/"))
+                    .map(|suffix| suffix.split('/').next().unwrap_or_default())
+            })
+            .or_else(|| {
+                self.arguments
+                    .windows(2)
+                    .find(|args| args[0] == "-applaunch")
+                    .and_then(|args| args[1].to_str())
+            })?;
+        // Steam shortcut IDs can exceed u32. They are not uninstallable library app IDs.
+        let id = id.parse::<u32>().ok().filter(|id| *id > 0)?;
+        Some(format!(
+            "{} steam://uninstall/{id}",
+            shell_quote(self.executable.to_str()?)
+        ))
     }
 }
 
@@ -183,7 +218,7 @@ mod tests {
     use gio_unix::DesktopAppInfo;
     use gtk4::glib::{KeyFile, object::Cast};
 
-    use super::{for_app_with_owner, shell_quote};
+    use super::{Launch, for_app_with_owner, shell_quote};
 
     fn desktop(exec: &str) -> DesktopAppInfo {
         let keyfile = KeyFile::new();
@@ -238,6 +273,38 @@ mod tests {
             command.is_none(),
             "unknown apps must not uninstall their interpreter"
         );
+    }
+
+    #[test]
+    fn steam_games_use_the_game_id_instead_of_uninstalling_steam() {
+        let app = desktop("env steam steam://rungameid/730");
+        assert_eq!(
+            for_app_with_owner(app.upcast_ref(), |_| None).as_deref(),
+            Some("steam steam://uninstall/730")
+        );
+    }
+
+    #[test]
+    fn steam_handles_applaunch_and_rejects_shortcuts_and_invalid_ids() {
+        let launch =
+            Launch::parse(Path::new("steam -applaunch 730 -novid")).expect("valid command");
+        assert_eq!(
+            launch.steam_uninstall().as_deref(),
+            Some("steam steam://uninstall/730")
+        );
+        for command in [
+            "steam steam://rungameid/12345678901234567890",
+            "steam steam://rungameid/0",
+            "steam steam://rungameid/730;bad",
+            "steam steam://rungameid/",
+            "steam",
+        ] {
+            let launch = Launch::parse(Path::new(command)).expect("valid command text");
+            assert!(
+                launch.steam_uninstall().is_none(),
+                "invalid game ID accepted: {command}"
+            );
+        }
     }
 
     #[test]
