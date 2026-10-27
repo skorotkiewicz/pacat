@@ -124,6 +124,10 @@ fn trash_command(paths: &[PathBuf]) -> Option<String> {
 // Detect self-contained bundles such as ~/apps/Delta.app/bin/delta and suggest
 // trashing the whole bundle together with its launcher.
 fn bundle_trash_command(executable: &Path, desktop_file: &Path) -> Option<String> {
+    // A self-contained AppImage is the whole application; remove it as a file.
+    if executable.extension() == Some(OsStr::new("AppImage")) {
+        return trash_command(&[executable.to_path_buf(), desktop_file.to_path_buf()]);
+    }
     let bin = executable.parent()?;
     if bin.file_name()? != "bin" {
         return None;
@@ -436,6 +440,37 @@ mod tests {
         let expected = format!(
             "gio trash -- {}",
             shell_quote(root.join("plain.desktop").to_str().expect("fixture path"))
+        );
+        assert_eq!(command.as_deref(), Some(expected.as_str()));
+        fs::remove_dir_all(&root).expect("clean up fixture");
+    }
+
+    #[test]
+    fn appimages_are_trashed_as_single_files_with_their_launcher() {
+        let root = std::env::temp_dir().join(format!(
+            "pacat-appimage-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        let appimage = root.join("solidcraft-0.7.0-linux-x86_64.AppImage");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        fs::write(&appimage, "#!/bin/sh\n").expect("create fixture AppImage");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&appimage, fs::Permissions::from_mode(0o755))
+            .expect("make fixture executable");
+        let exec = format!("\"{}\" %F", appimage.display());
+        let launcher = root.join("ai.storyteller.solvecraft.desktop");
+        fs::write(
+            &launcher,
+            format!("[Desktop Entry]\nType=Application\nName=SolidCraft\nExec={exec}\n"),
+        )
+        .expect("create fixture launcher");
+        let app = DesktopAppInfo::from_filename(&launcher).expect("valid launcher");
+        let command = for_app_with_owner(app.upcast_ref(), |_| None);
+        let expected = format!(
+            "gio trash -- {} {}",
+            shell_quote(appimage.to_str().expect("fixture path")),
+            shell_quote(launcher.to_str().expect("fixture path"))
         );
         assert_eq!(command.as_deref(), Some(expected.as_str()));
         fs::remove_dir_all(&root).expect("clean up fixture");

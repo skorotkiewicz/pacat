@@ -5,6 +5,9 @@ use gtk::prelude::{BoxExt, ButtonExt, EditableExt, GtkWindowExt, ListBoxRowExt, 
 use gtk::{gio, glib};
 use gtk4 as gtk;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::uninstall_command;
 
 pub(crate) fn main() -> glib::ExitCode {
@@ -15,14 +18,91 @@ pub(crate) fn main() -> glib::ExitCode {
     application.run()
 }
 
-fn build_window(application: &gtk::Application) {
-    // Match Rudo's application picker: visible desktop apps, sorted by display name.
+// Match Rudo's application picker: visible desktop apps, sorted by display name.
+fn load_apps() -> Vec<gio::AppInfo> {
     let mut apps: Vec<_> = gio::AppInfo::all()
         .into_iter()
         .filter(|app| app.should_show() && app.id().is_some())
         .collect();
     apps.sort_by_cached_key(|app| app.display_name().to_lowercase());
+    apps
+}
 
+// Everything the search box matches, lowercased.
+fn search_key(app: &gio::AppInfo) -> String {
+    let description = app
+        .downcast_ref::<DesktopAppInfo>()
+        .and_then(|entry| entry.description().or_else(|| entry.generic_name()));
+    format!(
+        "{} {} {} {}",
+        app.display_name(),
+        app.id().unwrap_or_default(),
+        app.executable().display(),
+        description.unwrap_or_default()
+    )
+    .to_lowercase()
+}
+
+// Rc is for shared UI state between the selection, filter and refresh
+// callbacks; GTK widgets outlive single borrows.
+type Shared<T> = Rc<RefCell<T>>;
+
+// Drop all rows and rebuild the list from `apps`.
+fn rebuild_list(
+    list: &gtk::ListBox,
+    apps: &[gio::AppInfo],
+    keys: &Shared<Vec<String>>,
+    description: &gtk::Label,
+) {
+    while let Some(row) = list.row_at_index(0) {
+        list.remove(&row);
+    }
+    description.set_text(&format!(
+        "{} applications · Select an app to see its uninstall command",
+        apps.len()
+    ));
+    *keys.borrow_mut() = apps.iter().map(search_key).collect();
+    for app in apps {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        row.set_margin_top(10);
+        row.set_margin_bottom(10);
+        row.set_margin_start(12);
+        row.set_margin_end(12);
+        let image = gtk::Image::new();
+        image.set_pixel_size(36);
+        if let Some(icon) = app.icon() {
+            image.set_from_gicon(&icon);
+        } else {
+            image.set_icon_name(Some("application-x-executable"));
+        }
+        row.append(&image);
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        let name = gtk::Label::new(Some(&app.display_name()));
+        name.set_xalign(0.0);
+        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        name.add_css_class("heading");
+        let id = gtk::Label::new(app.id().as_deref());
+        id.set_xalign(0.0);
+        id.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        id.add_css_class("dim-label");
+        let entry = app.downcast_ref::<DesktopAppInfo>();
+        let summary = entry.and_then(|entry| entry.description().or_else(|| entry.generic_name()));
+        text.set_hexpand(true);
+        text.append(&name);
+        if let Some(summary) = summary {
+            let summary = gtk::Label::new(Some(&summary));
+            summary.set_xalign(0.0);
+            summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            summary.add_css_class("dim-label");
+            text.append(&summary);
+        }
+        text.append(&id);
+        row.append(&text);
+        list.append(&row);
+    }
+}
+
+fn build_window(application: &gtk::Application) {
     let window = gtk::ApplicationWindow::builder()
         .application(application)
         .title("Pacat")
@@ -35,14 +115,17 @@ fn build_window(application: &gtk::Application) {
     content.set_margin_start(18);
     content.set_margin_end(18);
 
+    let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     let title = gtk::Label::new(Some("Installed applications"));
     title.set_xalign(0.0);
     title.add_css_class("title-2");
-    content.append(&title);
-    let description = gtk::Label::new(Some(&format!(
-        "{} applications · Select an app to see its uninstall command",
-        apps.len()
-    )));
+    title.set_hexpand(true);
+    title_row.append(&title);
+    let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
+    refresh.set_tooltip_text(Some("Reload the application list"));
+    title_row.append(&refresh);
+    content.append(&title_row);
+    let description = gtk::Label::new(Some("Loading…"));
     description.set_xalign(0.0);
     description.set_wrap(true);
     description.add_css_class("dim-label");
@@ -83,65 +166,19 @@ fn build_window(application: &gtk::Application) {
     notice.add_css_class("dim-label");
     content.append(&notice);
 
-    let keys: Vec<_> = apps
-        .iter()
-        .map(|app| {
-            let description = app
-                .downcast_ref::<DesktopAppInfo>()
-                .and_then(|entry| entry.description().or_else(|| entry.generic_name()));
-            format!(
-                "{} {} {} {}",
-                app.display_name(),
-                app.id().unwrap_or_default(),
-                app.executable().display(),
-                description.unwrap_or_default()
-            )
-            .to_lowercase()
-        })
-        .collect();
-    for app in &apps {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        row.set_margin_top(10);
-        row.set_margin_bottom(10);
-        row.set_margin_start(12);
-        row.set_margin_end(12);
-        let image = gtk::Image::new();
-        image.set_pixel_size(36);
-        if let Some(icon) = app.icon() {
-            image.set_from_gicon(&icon);
-        } else {
-            image.set_icon_name(Some("application-x-executable"));
-        }
-        row.append(&image);
-        let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
-        let name = gtk::Label::new(Some(&app.display_name()));
-        name.set_xalign(0.0);
-        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        name.add_css_class("heading");
-        let id = gtk::Label::new(app.id().as_deref());
-        id.set_xalign(0.0);
-        id.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        id.add_css_class("dim-label");
-        let entry = app.downcast_ref::<DesktopAppInfo>();
-        let description =
-            entry.and_then(|entry| entry.description().or_else(|| entry.generic_name()));
-        text.set_hexpand(true);
-        text.append(&name);
-        if let Some(description) = description {
-            let summary = gtk::Label::new(Some(&description));
-            summary.set_xalign(0.0);
-            summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            summary.add_css_class("dim-label");
-            text.append(&summary);
-        }
-        text.append(&id);
-        row.append(&text);
-        list.append(&row);
-    }
+    // Shared between the selection, filter and refresh callbacks.
+    let apps = Rc::new(RefCell::new(Vec::new()));
+    let keys = Rc::new(RefCell::new(Vec::new()));
+    let initial = load_apps();
+    rebuild_list(&list, &initial, &keys, &description);
+    *apps.borrow_mut() = initial;
     let filter_search = search.clone();
+    let filter_keys = keys.clone();
     list.set_filter_func(move |row| {
         let query = filter_search.text().to_lowercase();
-        keys.get(row.index() as usize)
+        filter_keys
+            .borrow()
+            .get(row.index() as usize)
             .is_some_and(|key| key.contains(query.trim()))
     });
     let weak_list = list.downgrade();
@@ -157,13 +194,16 @@ fn build_window(application: &gtk::Application) {
     });
     let selected_command = command.clone();
     let selected_copy = copy.clone();
+    let selected_apps = apps.clone();
     list.connect_row_selected(move |_, row| {
-        let Some(app) = row.and_then(|row| apps.get(row.index() as usize)) else {
+        let Some(app) =
+            row.and_then(|row| selected_apps.borrow().get(row.index() as usize).cloned())
+        else {
             selected_command.set_text("Select an application");
             selected_copy.set_sensitive(false);
             return;
         };
-        match uninstall_command::for_app(app) {
+        match uninstall_command::for_app(&app) {
             Some(text) => {
                 selected_command.set_text(&text);
                 selected_copy.set_sensitive(true);
@@ -175,7 +215,21 @@ fn build_window(application: &gtk::Application) {
             }
         }
     });
+    let refresh_list = list.clone();
+    let refresh_apps = apps.clone();
+    let refresh_keys = keys.clone();
+    let refresh_description = description.clone();
+    let refresh_command = command.clone();
+    let refresh_copy = copy.clone();
     copy.connect_clicked(move |_| command.clipboard().set_text(&command.text()));
+    refresh.connect_clicked(move |_| {
+        let apps = load_apps();
+        refresh_list.unselect_all();
+        rebuild_list(&refresh_list, &apps, &refresh_keys, &refresh_description);
+        *refresh_apps.borrow_mut() = apps;
+        refresh_command.set_text("Select an application");
+        refresh_copy.set_sensitive(false);
+    });
     window.set_child(Some(&content));
     window.present();
     search.grab_focus();
