@@ -1,5 +1,6 @@
 use gio::prelude::{AppInfoExt, ApplicationExt, ApplicationExtManual};
-use gtk::glib::object::ObjectExt;
+use gio_unix::DesktopAppInfo;
+use gtk::glib::object::{Cast, ObjectExt};
 use gtk::prelude::{BoxExt, ButtonExt, EditableExt, GtkWindowExt, ListBoxRowExt, WidgetExt};
 use gtk::{gio, glib};
 use gtk4 as gtk;
@@ -85,11 +86,15 @@ fn build_window(application: &gtk::Application) {
     let keys: Vec<_> = apps
         .iter()
         .map(|app| {
+            let description = app
+                .downcast_ref::<DesktopAppInfo>()
+                .and_then(|entry| entry.description().or_else(|| entry.generic_name()));
             format!(
-                "{} {} {}",
+                "{} {} {} {}",
                 app.display_name(),
                 app.id().unwrap_or_default(),
-                app.executable().display()
+                app.executable().display(),
+                description.unwrap_or_default()
             )
             .to_lowercase()
         })
@@ -117,8 +122,18 @@ fn build_window(application: &gtk::Application) {
         id.set_xalign(0.0);
         id.set_ellipsize(gtk::pango::EllipsizeMode::End);
         id.add_css_class("dim-label");
+        let entry = app.downcast_ref::<DesktopAppInfo>();
+        let description =
+            entry.and_then(|entry| entry.description().or_else(|| entry.generic_name()));
         text.set_hexpand(true);
         text.append(&name);
+        if let Some(description) = description {
+            let summary = gtk::Label::new(Some(&description));
+            summary.set_xalign(0.0);
+            summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            summary.add_css_class("dim-label");
+            text.append(&summary);
+        }
         text.append(&id);
         row.append(&text);
         list.append(&row);

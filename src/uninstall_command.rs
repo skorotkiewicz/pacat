@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -33,6 +33,19 @@ fn for_app_with_owner(
     if let Some(launch) = &launch
         && matches!(launch.executable.file_name()?.to_str()?, "wine" | "wine64")
     {
+        // A missing prefix means the entry is dead: the uninstaller would only
+        // create a fresh, empty prefix, so only the launcher remains to clean up.
+        let default_prefix = glib::home_dir().join(".wine");
+        let prefix = launch
+            .wine_prefix
+            .as_ref()
+            .map(Path::new)
+            .unwrap_or(default_prefix.as_path());
+        if !prefix.is_dir()
+            && let Some(filename) = desktop.filename()
+        {
+            return wine_dead_command(&filename);
+        }
         let wine = shell_quote(launch.executable.to_str()?);
         return Some(match &launch.wine_prefix {
             Some(prefix) => format!(
@@ -68,8 +81,73 @@ fn for_app_with_owner(
     ) {
         return None;
     }
-    let executable = glib::find_program_in_path(executable)?;
-    lookup_path(&executable, &mut owner)
+    let Some(executable) = glib::find_program_in_path(executable) else {
+        // Dead entry: its executable is gone, so only the launcher remains to clean up.
+        return trash_command(&[desktop.filename()?]);
+    };
+    lookup_path(&executable, &mut owner).or_else(|| {
+        let resolved = executable.canonicalize().ok()?;
+        let desktop_file = desktop.filename()?;
+        bundle_trash_command(&resolved, &desktop_file)
+    })
+}
+
+// A dead wine entry leaves only its launchers behind. Wine gives every app
+// its own directory under wine/Programs, so the whole directory is the
+// cleanup target unless another launcher shares it.
+fn wine_dead_command(desktop_file: &Path) -> Option<String> {
+    let programs = glib::home_dir().join(".local/share/applications/wine/Programs");
+    dead_wine_launcher(desktop_file, &programs)
+}
+
+fn dead_wine_launcher(desktop_file: &Path, programs: &Path) -> Option<String> {
+    let dir = desktop_file.parent()?;
+    let shared = dir.read_dir().ok()?.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        path.extension() == Some(OsStr::new("desktop")) && path != desktop_file
+    });
+    if dir.starts_with(programs) && !shared {
+        trash_command(&[dir.to_path_buf()])
+    } else {
+        trash_command(&[desktop_file.to_path_buf()])
+    }
+}
+
+fn trash_command(paths: &[PathBuf]) -> Option<String> {
+    let paths = paths
+        .iter()
+        .map(|path| path.to_str().map(shell_quote))
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("gio trash -- {}", paths.join(" ")))
+}
+
+// Detect self-contained bundles such as ~/apps/Delta.app/bin/delta and suggest
+// trashing the whole bundle together with its launcher.
+fn bundle_trash_command(executable: &Path, desktop_file: &Path) -> Option<String> {
+    let bin = executable.parent()?;
+    if bin.file_name()? != "bin" {
+        return None;
+    }
+    let bundle = bin.parent()?;
+    // A bin/ under a standard prefix is a shared system location, not a bundle.
+    let prefixes = [
+        glib::home_dir().join(".local"),
+        PathBuf::from("/usr"),
+        PathBuf::from("/usr/local"),
+        PathBuf::from("/opt"),
+    ];
+    if prefixes.iter().any(|prefix| bundle == prefix.as_path()) || !bundle.is_dir() {
+        return None;
+    }
+    let mut paths = vec![bundle.to_path_buf(), desktop_file.to_path_buf()];
+    // A launcher symlink in ~/.local/bin pointing into the bundle goes with it.
+    let link = glib::home_dir()
+        .join(".local/bin")
+        .join(executable.file_name()?);
+    if link.is_symlink() && link.canonicalize().ok() == Some(executable.to_path_buf()) {
+        paths.push(link);
+    }
+    trash_command(&paths)
 }
 
 fn lookup_path(path: &Path, owner: &mut impl FnMut(&Path) -> Option<String>) -> Option<String> {
@@ -213,12 +291,89 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use gio_unix::DesktopAppInfo;
     use gtk4::glib::{KeyFile, object::Cast};
 
-    use super::{Launch, for_app_with_owner, shell_quote};
+    use super::{Launch, dead_wine_launcher, for_app_with_owner, shell_quote};
+
+    struct TestBundle {
+        root: PathBuf,
+        executable: PathBuf,
+        launcher: PathBuf,
+        bundled_launcher: PathBuf,
+    }
+
+    impl TestBundle {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "pacat-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let bundle = root.join("Example App.app");
+            let executable = bundle.join("bin/example");
+            let launcher = root.join("applications/org.example.App.desktop");
+            let bundled_launcher = bundle.join("share/applications/org.example.App.desktop");
+            for file in [&executable, &launcher, &bundled_launcher] {
+                fs::create_dir_all(file.parent().expect("fixture parent"))
+                    .expect("create fixture directory");
+            }
+            let true_executable =
+                gtk4::glib::find_program_in_path("true").expect("system true executable");
+            fs::copy(true_executable, &executable).expect("create fixture executable");
+            let contents = format!(
+                "[Desktop Entry]\nType=Application\nName=Example App\nExec=\"{}\" %U\n",
+                executable.display()
+            );
+            fs::write(&launcher, &contents).expect("create launcher");
+            fs::write(&bundled_launcher, contents).expect("create bundled launcher");
+            Self {
+                root,
+                executable,
+                launcher,
+                bundled_launcher,
+            }
+        }
+
+        fn app(&self) -> DesktopAppInfo {
+            DesktopAppInfo::from_filename(&self.launcher).expect("valid launcher")
+        }
+    }
+
+    impl Drop for TestBundle {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn manual_bundles_are_detected_without_application_names_or_fixed_paths() {
+        let bundle = TestBundle::new();
+        let app = bundle.app();
+        let command = for_app_with_owner(app.upcast_ref(), |_| None);
+        assert_eq!(
+            command,
+            Some(format!(
+                "gio trash -- {} {}",
+                shell_quote(
+                    bundle
+                        .executable
+                        .parent()
+                        .and_then(Path::parent)
+                        .expect("bundle root")
+                        .to_str()
+                        .expect("fixture path")
+                ),
+                shell_quote(bundle.launcher.to_str().expect("fixture path"))
+            ))
+        );
+    }
 
     fn desktop(exec: &str) -> DesktopAppInfo {
         let keyfile = KeyFile::new();
@@ -249,6 +404,41 @@ mod tests {
             for_app_with_owner(app.upcast_ref(), true_owner).as_deref(),
             Some("sudo pacman -R -- test-app")
         );
+    }
+
+    #[test]
+    fn wine_dead_command_targets_the_app_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "pacat-wine-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        // The launcher must sit under wine/Programs, so test the helper with
+        // a fixture root instead of the real home directory.
+        let programs = root.join("wine/Programs");
+        let dir = programs.join("YootTower");
+        fs::create_dir_all(&dir).expect("create wine programs directory");
+        let launcher = dir.join("Yoot Tower.desktop");
+        fs::write(
+            &launcher,
+            "[Desktop Entry]\nType=Application\nName=Yoot Tower\n",
+        )
+        .expect("create launcher");
+        let command = dead_wine_launcher(&launcher, &programs);
+        let expected = format!(
+            "gio trash -- {}",
+            shell_quote(dir.to_str().expect("fixture path"))
+        );
+        assert_eq!(command.as_deref(), Some(expected.as_str()));
+
+        // A launcher outside wine/Programs only loses its own file.
+        let command = dead_wine_launcher(&root.join("plain.desktop"), &programs);
+        let expected = format!(
+            "gio trash -- {}",
+            shell_quote(root.join("plain.desktop").to_str().expect("fixture path"))
+        );
+        assert_eq!(command.as_deref(), Some(expected.as_str()));
+        fs::remove_dir_all(&root).expect("clean up fixture");
     }
 
     #[test]
