@@ -1,0 +1,8 @@
+[package]
+name = "pacat"
+version = "0.1.0"
+edition = "2024"
+description = "Browse installed Linux packages and preview uninstall commands"
+
+[dependencies]
+gtk4 = "0.11.5"
