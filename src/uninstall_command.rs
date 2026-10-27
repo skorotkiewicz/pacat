@@ -1,4 +1,5 @@
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -47,13 +48,22 @@ fn for_app_with_owner(
             return wine_dead_command(&filename);
         }
         let wine = shell_quote(launch.executable.to_str()?);
-        return Some(match &launch.wine_prefix {
+        let uninstaller = match &launch.wine_prefix {
             Some(prefix) => format!(
                 "WINEPREFIX={} {wine} uninstaller",
                 shell_quote(prefix.to_str()?)
             ),
             None => format!("{wine} uninstaller"),
-        });
+        };
+        // The uninstaller rarely knows apps installed as plain folders; when
+        // the shortcut's target resolves, also show a trash command for them.
+        return match desktop
+            .filename()
+            .and_then(|filename| wine_files_command(launch, prefix, &filename))
+        {
+            Some(files) => Some(format!("{uninstaller}\n{files}")),
+            None => Some(uninstaller),
+        };
     }
     if let Some(filename) = desktop.filename()
         && let Some(command) = lookup_path(&filename, &mut owner)
@@ -151,6 +161,109 @@ fn bundle_trash_command(executable: &Path, desktop_file: &Path) -> Option<String
     if link.is_symlink() && link.canonicalize().ok() == Some(executable.to_path_buf()) {
         paths.push(link);
     }
+    trash_command(&paths)
+}
+
+// Map a Windows path inside the prefix's C: drive or the default Z: drive to
+// its Unix location.
+fn windows_to_unix(prefix: &Path, path: &str) -> Option<PathBuf> {
+    let (drive, rest) = path.split_once(':')?;
+    let root = match drive {
+        "C" | "c" => prefix.join("drive_c"),
+        "Z" | "z" => PathBuf::from("/"),
+        _ => return None,
+    };
+    let rest = rest.trim_start_matches(['\\', '/']).replace('\\', "/");
+    Some(root.join(rest))
+}
+
+// Read the shortcut's target path. Wine writes ANSI LocalBasePath entries.
+fn lnk_target(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    if data.len() < 0x4C || data[0..4] != [0x4C, 0x00, 0x00, 0x00] {
+        return None;
+    }
+    let flags = u32::from_le_bytes(data.get(0x14..0x18)?.try_into().ok()?);
+    let mut offset = 0x4C_usize;
+    if flags & 1 != 0 {
+        // Skip the item ID list: a zero-terminated sequence of size-prefixed items.
+        loop {
+            let size = usize::from(u16::from_le_bytes(
+                data.get(offset..offset + 2)?.try_into().ok()?,
+            ));
+            if size == 0 {
+                offset += 2;
+                break;
+            }
+            offset += size;
+        }
+    }
+    if flags & 2 == 0 {
+        return None; // no LinkInfo
+    }
+    let info = data.get(offset..)?;
+    let lbp = usize::try_from(u32::from_le_bytes(info.get(0x10..0x14)?.try_into().ok()?)).ok()?;
+    let base = info.get(lbp..)?;
+    let end = base.iter().position(|&byte| byte == 0)?;
+    String::from_utf8(base.get(..end)?.to_vec()).ok()
+}
+
+// Directories the app's exe may sit in without owning them.
+fn is_shared_dir(dir: &Path) -> bool {
+    let home = glib::home_dir();
+    let mut generic = vec![
+        home.clone(),
+        home.join("Desktop"),
+        home.join("Downloads"),
+        home.join("Documents"),
+        PathBuf::from("/"),
+        PathBuf::from("/usr"),
+        PathBuf::from("/opt"),
+        PathBuf::from("/etc"),
+        PathBuf::from("/var"),
+        PathBuf::from("/bin"),
+        PathBuf::from("/sbin"),
+        PathBuf::from("/lib"),
+        PathBuf::from("/lib64"),
+    ];
+    let Some(drive_c) = dir
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "drive_c"))
+    else {
+        return generic.iter().any(|path| path.as_path() == dir);
+    };
+    generic.push(drive_c.to_path_buf());
+    for system in ["windows", "users", "ProgramData", "Program Files"] {
+        generic.push(drive_c.join(system));
+    }
+    generic.iter().any(|path| path.as_path() == dir)
+}
+
+// Best-effort resolution of the program files behind a wine launcher: follow
+// the .lnk shortcut (or a direct .exe argument) and suggest trashing its
+// directory together with the desktop entry.
+fn wine_files_command(launch: &Launch, prefix: &Path, desktop_file: &Path) -> Option<String> {
+    let target = {
+        let windows = launch.arguments.iter().find_map(|argument| {
+            let argument = argument.to_str()?;
+            let lower = argument.to_ascii_lowercase();
+            if lower.ends_with(".lnk") {
+                lnk_target(&windows_to_unix(prefix, argument)?)
+            } else if lower.ends_with(".exe") {
+                Some(argument.to_string())
+            } else {
+                None
+            }
+        })?;
+        windows_to_unix(prefix, &windows)?
+    };
+    let dir = target.parent()?;
+    let mut paths = if is_shared_dir(dir) {
+        vec![target]
+    } else {
+        vec![dir.to_path_buf()]
+    };
+    paths.push(desktop_file.to_path_buf());
     trash_command(&paths)
 }
 
@@ -474,6 +587,66 @@ mod tests {
         );
         assert_eq!(command.as_deref(), Some(expected.as_str()));
         fs::remove_dir_all(&root).expect("clean up fixture");
+    }
+
+    #[test]
+    fn wine_apps_with_resolvable_shortcuts_also_trash_their_files() {
+        let root = std::env::temp_dir().join(format!(
+            "pacat-wine-lnk-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        let prefix = root.join(".wine");
+        let lnk_path = prefix.join(
+            "drive_c/users/mod/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Aivition.lnk",
+        );
+        fs::create_dir_all(lnk_path.parent().expect("lnk parent")).expect("create prefix");
+        fs::write(
+            &lnk_path,
+            lnk_bytes(r"Z:\home\mod\Desktop\Aivition\Aivition.exe"),
+        )
+        .expect("create lnk");
+        let launcher = root.join("Aivition.desktop");
+        let lnk_arg = r"C:\\users\\mod\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Aivition.lnk";
+        fs::write(
+            &launcher,
+            format!(
+                "[Desktop Entry]\nType=Application\nName=Aivition\nExec=env \"WINEPREFIX={}\" wine \"{lnk_arg}\"\n",
+                prefix.display()
+            ),
+        )
+        .expect("create launcher");
+        let app = DesktopAppInfo::from_filename(&launcher).expect("valid launcher");
+        let command =
+            for_app_with_owner(app.upcast_ref(), |_| panic!("no ownership query for wine"));
+        let expected = format!(
+            "WINEPREFIX={} wine uninstaller\ngio trash -- {} {}",
+            shell_quote(prefix.to_str().expect("path")),
+            shell_quote("/home/mod/Desktop/Aivition"),
+            shell_quote(launcher.to_str().expect("path"))
+        );
+        assert_eq!(command.as_deref(), Some(expected.as_str()));
+        fs::remove_dir_all(&root).expect("clean up fixture");
+    }
+
+    fn lnk_bytes(target: &str) -> Vec<u8> {
+        let mut data = vec![0u8; 0x4C];
+        data[0..4].copy_from_slice(&0x4C_u32.to_le_bytes());
+        // HasLinkTargetIDList and HasLinkInfo, the layout wine writes.
+        data[0x14..0x18].copy_from_slice(&3_u32.to_le_bytes());
+        // A minimal item ID list: one dummy item, then the zero terminator.
+        data.extend_from_slice(&20_u16.to_le_bytes());
+        data.extend_from_slice(&[0u8; 18]);
+        data.extend_from_slice(&0_u16.to_le_bytes());
+        let path = target.as_bytes();
+        let info_size = 0x1C + path.len() + 1;
+        let mut info = vec![0u8; info_size];
+        info[0..4].copy_from_slice(&(info_size as u32).to_le_bytes());
+        info[4..8].copy_from_slice(&0x1C_u32.to_le_bytes());
+        info[0x10..0x14].copy_from_slice(&0x1C_u32.to_le_bytes());
+        info[0x1C..0x1C + path.len()].copy_from_slice(path);
+        data.extend_from_slice(&info);
+        data
     }
 
     #[test]
