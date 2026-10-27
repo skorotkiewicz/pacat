@@ -156,6 +156,13 @@ fn build_window(application: &gtk::Application) {
     command.set_margin_top(6);
     command.set_margin_bottom(6);
     content.append(&command);
+    let file = gtk::Label::new(None);
+    file.set_selectable(true);
+    file.set_wrap(true);
+    file.set_xalign(0.0);
+    file.add_css_class("dim-label");
+    file.set_visible(false);
+    content.append(&file);
     let copy = gtk::Button::with_label("Copy command");
     copy.set_sensitive(false);
     content.append(&copy);
@@ -184,6 +191,7 @@ fn build_window(application: &gtk::Application) {
     let weak_list = list.downgrade();
     let search_command = command.clone();
     let search_copy = copy.clone();
+    let search_file = file.clone();
     search.connect_search_changed(move |_| {
         if let Some(list) = weak_list.upgrade() {
             list.unselect_all();
@@ -191,18 +199,28 @@ fn build_window(application: &gtk::Application) {
         }
         search_command.set_text("Select an application");
         search_copy.set_sensitive(false);
+        search_file.set_visible(false);
     });
     let selected_command = command.clone();
     let selected_copy = copy.clone();
     let selected_apps = apps.clone();
+    let selected_file = file.clone();
     list.connect_row_selected(move |_, row| {
         let Some(app) =
             row.and_then(|row| selected_apps.borrow().get(row.index() as usize).cloned())
         else {
             selected_command.set_text("Select an application");
             selected_copy.set_sensitive(false);
+            selected_file.set_visible(false);
             return;
         };
+        if let Some(path) = app
+            .downcast_ref::<DesktopAppInfo>()
+            .and_then(|entry| entry.filename())
+        {
+            selected_file.set_text(&path.display().to_string());
+            selected_file.set_visible(true);
+        }
         match uninstall_command::for_app(&app) {
             Some(text) => {
                 selected_command.set_text(&text);
@@ -221,6 +239,7 @@ fn build_window(application: &gtk::Application) {
     let refresh_description = description.clone();
     let refresh_command = command.clone();
     let refresh_copy = copy.clone();
+    let refresh_file = file.clone();
     copy.connect_clicked(move |_| command.clipboard().set_text(&command.text()));
     refresh.connect_clicked(move |_| {
         let apps = load_apps();
@@ -229,6 +248,7 @@ fn build_window(application: &gtk::Application) {
         *refresh_apps.borrow_mut() = apps;
         refresh_command.set_text("Select an application");
         refresh_copy.set_sensitive(false);
+        refresh_file.set_visible(false);
     });
     window.set_child(Some(&content));
     window.present();
