@@ -6,3 +6,4 @@ description = "Browse installed Linux packages and preview uninstall commands"
 
 [dependencies]
 gtk4 = "0.11.5"
+gio-unix = "0.22.0"

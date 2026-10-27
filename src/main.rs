@@ -1,8 +1,7 @@
 #![warn(missing_docs)]
-//! Browse installed packages without executing uninstall commands.
+//! Desktop application browser with uninstall command previews.
 
 mod app;
-mod catalog;
-mod package;
+mod uninstall_command;
 
 use app::main;
