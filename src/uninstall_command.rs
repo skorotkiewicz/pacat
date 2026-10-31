@@ -12,6 +12,11 @@ pub(crate) fn for_app(app: &gio::AppInfo) -> Option<String> {
     for_app_with_owner(app, owner_command)
 }
 
+/// Looks up the package owning a CLI executable or its resolved symlink target.
+pub(crate) fn for_executable(executable: &Path) -> Option<String> {
+    lookup_path(executable, &mut owner_command)
+}
+
 fn for_app_with_owner(
     app: &gio::AppInfo,
     mut owner: impl FnMut(&Path) -> Option<String>,
@@ -416,7 +421,7 @@ mod tests {
     use gio_unix::DesktopAppInfo;
     use gtk4::glib::{KeyFile, object::Cast};
 
-    use super::{Launch, dead_wine_launcher, for_app_with_owner, shell_quote};
+    use super::{Launch, dead_wine_launcher, for_app_with_owner, lookup_path, shell_quote};
 
     struct TestBundle {
         root: PathBuf,
@@ -508,6 +513,27 @@ mod tests {
             for_app_with_owner(app.upcast_ref(), true_owner).as_deref(),
             Some("sudo pacman -R -- test-app")
         );
+    }
+
+    #[test]
+    fn executable_symlinks_fall_back_to_the_target_package_owner() {
+        let bundle = TestBundle::new();
+        let link = bundle.root.join("cli-tool");
+        std::os::unix::fs::symlink(&bundle.executable, &link).expect("create CLI symlink");
+        let target = bundle
+            .executable
+            .canonicalize()
+            .expect("resolve executable");
+        let mut queried = Vec::new();
+        let command = lookup_path(&link, &mut |path| {
+            queried.push(path.to_path_buf());
+            (path == target).then(|| "sudo pacman -R -- example-package".into())
+        });
+        assert_eq!(
+            command.as_deref(),
+            Some("sudo pacman -R -- example-package")
+        );
+        assert_eq!(queried, [link, target]);
     }
 
     #[test]

@@ -6,8 +6,10 @@ use gtk::{gio, glib};
 use gtk4 as gtk;
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::cli_app::CliApp;
 use crate::uninstall_command;
 
 pub(crate) fn main() -> glib::ExitCode {
@@ -18,29 +20,110 @@ pub(crate) fn main() -> glib::ExitCode {
     application.run()
 }
 
-// Visible desktop apps, sorted by display name.
-fn load_apps() -> Vec<gio::AppInfo> {
-    let mut apps: Vec<_> = gio::AppInfo::all()
-        .into_iter()
-        .filter(|app| app.should_show() && app.id().is_some())
-        .collect();
-    apps.sort_by_cached_key(|app| app.display_name().to_lowercase());
-    apps
+#[derive(Clone, Copy)]
+enum AppKind {
+    Desktop,
+    Cli,
 }
 
-// Everything the search box matches, lowercased.
-fn search_key(app: &gio::AppInfo) -> String {
-    let description = app
-        .downcast_ref::<DesktopAppInfo>()
-        .and_then(|entry| entry.description().or_else(|| entry.generic_name()));
-    format!(
-        "{} {} {} {}",
-        app.display_name(),
-        app.id().unwrap_or_default(),
-        app.executable().display(),
-        description.unwrap_or_default()
-    )
-    .to_lowercase()
+impl AppKind {
+    fn load(self) -> Vec<InstalledApp> {
+        match self {
+            Self::Desktop => {
+                let mut apps: Vec<_> = gio::AppInfo::all()
+                    .into_iter()
+                    .filter(|app| app.should_show() && app.id().is_some())
+                    .map(InstalledApp::Desktop)
+                    .collect();
+                apps.sort_by_cached_key(|app| app.name().to_lowercase());
+                apps
+            }
+            Self::Cli => CliApp::installed()
+                .into_iter()
+                .map(InstalledApp::Cli)
+                .collect(),
+        }
+    }
+
+    fn description(self, count: usize) -> String {
+        match self {
+            Self::Desktop => {
+                format!("{count} applications · Select an app to see its uninstall command")
+            }
+            Self::Cli => {
+                format!("{count} commands on PATH · Includes helper commands and GUI launchers")
+            }
+        }
+    }
+}
+
+enum InstalledApp {
+    Desktop(gio::AppInfo),
+    Cli(CliApp),
+}
+
+impl InstalledApp {
+    fn name(&self) -> String {
+        match self {
+            Self::Desktop(app) => app.display_name().into(),
+            Self::Cli(app) => app.name.clone(),
+        }
+    }
+
+    fn identifier(&self) -> String {
+        match self {
+            Self::Desktop(app) => app.id().unwrap_or_default().into(),
+            Self::Cli(app) => app.executable.display().to_string(),
+        }
+    }
+
+    fn summary(&self) -> Option<String> {
+        match self {
+            Self::Desktop(app) => app
+                .downcast_ref::<DesktopAppInfo>()
+                .and_then(|entry| entry.description().or_else(|| entry.generic_name()))
+                .map(Into::into),
+            Self::Cli(_) => None,
+        }
+    }
+
+    fn icon(&self) -> Option<gio::Icon> {
+        match self {
+            Self::Desktop(app) => app.icon(),
+            Self::Cli(_) => None,
+        }
+    }
+
+    fn file(&self) -> Option<PathBuf> {
+        match self {
+            Self::Desktop(app) => app
+                .downcast_ref::<DesktopAppInfo>()
+                .and_then(|entry| entry.filename()),
+            Self::Cli(app) => Some(app.executable.clone()),
+        }
+    }
+
+    fn search_key(&self) -> String {
+        let executable = match self {
+            Self::Desktop(app) => app.executable(),
+            Self::Cli(app) => app.executable.clone(),
+        };
+        format!(
+            "{} {} {} {}",
+            self.name(),
+            self.identifier(),
+            executable.display(),
+            self.summary().unwrap_or_default()
+        )
+        .to_lowercase()
+    }
+
+    fn uninstall_command(&self) -> Option<String> {
+        match self {
+            Self::Desktop(app) => uninstall_command::for_app(app),
+            Self::Cli(app) => uninstall_command::for_executable(&app.executable),
+        }
+    }
 }
 
 // Rc is for shared UI state between the selection, filter and refresh
@@ -50,18 +133,16 @@ type Shared<T> = Rc<RefCell<T>>;
 // Drop all rows and rebuild the list from `apps`.
 fn rebuild_list(
     list: &gtk::ListBox,
-    apps: &[gio::AppInfo],
+    apps: &[InstalledApp],
     keys: &Shared<Vec<String>>,
     description: &gtk::Label,
+    kind: AppKind,
 ) {
     while let Some(row) = list.row_at_index(0) {
         list.remove(&row);
     }
-    description.set_text(&format!(
-        "{} applications · Select an app to see its uninstall command",
-        apps.len()
-    ));
-    *keys.borrow_mut() = apps.iter().map(search_key).collect();
+    description.set_text(&kind.description(apps.len()));
+    *keys.borrow_mut() = apps.iter().map(InstalledApp::search_key).collect();
     for app in apps {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         row.set_margin_top(10);
@@ -77,16 +158,15 @@ fn rebuild_list(
         }
         row.append(&image);
         let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
-        let name = gtk::Label::new(Some(&app.display_name()));
+        let name = gtk::Label::new(Some(&app.name()));
         name.set_xalign(0.0);
         name.set_ellipsize(gtk::pango::EllipsizeMode::End);
         name.add_css_class("heading");
-        let id = gtk::Label::new(app.id().as_deref());
+        let id = gtk::Label::new(Some(&app.identifier()));
         id.set_xalign(0.0);
         id.set_ellipsize(gtk::pango::EllipsizeMode::End);
         id.add_css_class("dim-label");
-        let entry = app.downcast_ref::<DesktopAppInfo>();
-        let summary = entry.and_then(|entry| entry.description().or_else(|| entry.generic_name()));
+        let summary = app.summary();
         text.set_hexpand(true);
         text.append(&name);
         if let Some(summary) = summary {
@@ -109,6 +189,20 @@ fn build_window(application: &gtk::Application) {
         .default_width(620)
         .default_height(720)
         .build();
+    let tabs = gtk::Notebook::new();
+    tabs.append_page(
+        &build_page(AppKind::Desktop),
+        Some(&gtk::Label::new(Some("Desktop apps"))),
+    );
+    tabs.append_page(
+        &build_page(AppKind::Cli),
+        Some(&gtk::Label::new(Some("CLI apps"))),
+    );
+    window.set_child(Some(&tabs));
+    window.present();
+}
+
+fn build_page(kind: AppKind) -> gtk::Box {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     content.set_margin_top(18);
     content.set_margin_bottom(18);
@@ -116,7 +210,10 @@ fn build_window(application: &gtk::Application) {
     content.set_margin_end(18);
 
     let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let title = gtk::Label::new(Some("Installed applications"));
+    let title = gtk::Label::new(Some(match kind {
+        AppKind::Desktop => "Installed desktop applications",
+        AppKind::Cli => "Installed CLI commands",
+    }));
     title.set_xalign(0.0);
     title.add_css_class("title-2");
     title.set_hexpand(true);
@@ -132,7 +229,10 @@ fn build_window(application: &gtk::Application) {
     content.append(&description);
 
     let search = gtk::SearchEntry::new();
-    search.set_placeholder_text(Some("Search applications"));
+    search.set_placeholder_text(Some(match kind {
+        AppKind::Desktop => "Search applications",
+        AppKind::Cli => "Search commands or paths",
+    }));
     content.append(&search);
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
@@ -176,8 +276,8 @@ fn build_window(application: &gtk::Application) {
     // Shared between the selection, filter and refresh callbacks.
     let apps = Rc::new(RefCell::new(Vec::new()));
     let keys = Rc::new(RefCell::new(Vec::new()));
-    let initial = load_apps();
-    rebuild_list(&list, &initial, &keys, &description);
+    let initial = kind.load();
+    rebuild_list(&list, &initial, &keys, &description, kind);
     *apps.borrow_mut() = initial;
     let filter_search = search.clone();
     let filter_keys = keys.clone();
@@ -206,29 +306,30 @@ fn build_window(application: &gtk::Application) {
     let selected_apps = apps.clone();
     let selected_file = file.clone();
     list.connect_row_selected(move |_, row| {
+        let apps = selected_apps.borrow();
         let Some(app) =
-            row.and_then(|row| selected_apps.borrow().get(row.index() as usize).cloned())
+            row.and_then(|row| apps.get(row.index() as usize))
         else {
             selected_command.set_text("Select an application");
             selected_copy.set_sensitive(false);
             selected_file.set_visible(false);
             return;
         };
-        if let Some(path) = app
-            .downcast_ref::<DesktopAppInfo>()
-            .and_then(|entry| entry.filename())
-        {
+        selected_file.set_visible(false);
+        if let Some(path) = app.file() {
             selected_file.set_text(&path.display().to_string());
             selected_file.set_visible(true);
         }
-        match uninstall_command::for_app(&app) {
+        match app.uninstall_command() {
             Some(text) => {
                 selected_command.set_text(&text);
                 selected_copy.set_sensitive(true);
             }
             None => {
-                selected_command
-                    .set_text("Could not determine an uninstall command for this application.");
+                selected_command.set_text(match app {
+                    InstalledApp::Desktop(_) => "Could not determine an uninstall command for this application.",
+                    InstalledApp::Cli(_) => "No system package owner found. This command may use another installer or have been installed manually.",
+                });
                 selected_copy.set_sensitive(false);
             }
         }
@@ -242,15 +343,19 @@ fn build_window(application: &gtk::Application) {
     let refresh_file = file.clone();
     copy.connect_clicked(move |_| command.clipboard().set_text(&command.text()));
     refresh.connect_clicked(move |_| {
-        let apps = load_apps();
+        let apps = kind.load();
         refresh_list.unselect_all();
-        rebuild_list(&refresh_list, &apps, &refresh_keys, &refresh_description);
+        rebuild_list(
+            &refresh_list,
+            &apps,
+            &refresh_keys,
+            &refresh_description,
+            kind,
+        );
         *refresh_apps.borrow_mut() = apps;
         refresh_command.set_text("Select an application");
         refresh_copy.set_sensitive(false);
         refresh_file.set_visible(false);
     });
-    window.set_child(Some(&content));
-    window.present();
-    search.grab_focus();
+    content
 }
