@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use crate::cli_app::CliApp;
+use crate::cli_group::CliGroup;
 use crate::uninstall_command;
 
 pub(crate) fn main() -> glib::ExitCode {
@@ -27,7 +27,7 @@ enum AppKind {
 }
 
 impl AppKind {
-    fn load(self) -> Vec<InstalledApp> {
+    async fn load(self) -> Option<Vec<InstalledApp>> {
         match self {
             Self::Desktop => {
                 let mut apps: Vec<_> = gio::AppInfo::all()
@@ -36,22 +36,39 @@ impl AppKind {
                     .map(InstalledApp::Desktop)
                     .collect();
                 apps.sort_by_cached_key(|app| app.name().to_lowercase());
-                apps
+                Some(apps)
             }
-            Self::Cli => CliApp::installed()
-                .into_iter()
-                .map(InstalledApp::Cli)
-                .collect(),
+            Self::Cli => {
+                let desktop_executables = gio::AppInfo::all()
+                    .into_iter()
+                    .filter(|app| app.should_show() && app.id().is_some())
+                    .filter_map(|app| uninstall_command::desktop_executable(&app))
+                    .collect::<Vec<_>>();
+                let groups = gio::spawn_blocking(move || CliGroup::installed(&desktop_executables))
+                    .await
+                    .ok()?;
+                Some(groups.into_iter().map(InstalledApp::Cli).collect())
+            }
         }
     }
 
-    fn description(self, count: usize) -> String {
+    fn description(self, apps: &[InstalledApp]) -> String {
+        let count = apps.len();
         match self {
             Self::Desktop => {
                 format!("{count} applications · Select an app to see its uninstall command")
             }
             Self::Cli => {
-                format!("{count} commands on PATH · Includes helper commands and GUI launchers")
+                let commands: usize = apps
+                    .iter()
+                    .map(|app| match app {
+                        InstalledApp::Cli(group) => group.binaries.len(),
+                        InstalledApp::Desktop(_) => 0,
+                    })
+                    .sum();
+                format!(
+                    "{commands} commands in {count} groups · Desktop app executables are hidden"
+                )
             }
         }
     }
@@ -59,7 +76,7 @@ impl AppKind {
 
 enum InstalledApp {
     Desktop(gio::AppInfo),
-    Cli(CliApp),
+    Cli(CliGroup),
 }
 
 impl InstalledApp {
@@ -73,7 +90,10 @@ impl InstalledApp {
     fn identifier(&self) -> String {
         match self {
             Self::Desktop(app) => app.id().unwrap_or_default().into(),
-            Self::Cli(app) => app.executable.display().to_string(),
+            Self::Cli(group) => group
+                .uninstall_command
+                .clone()
+                .unwrap_or_else(|| "No system package owner found".into()),
         }
     }
 
@@ -83,7 +103,14 @@ impl InstalledApp {
                 .downcast_ref::<DesktopAppInfo>()
                 .and_then(|entry| entry.description().or_else(|| entry.generic_name()))
                 .map(Into::into),
-            Self::Cli(_) => None,
+            Self::Cli(group) => Some(
+                group
+                    .binaries
+                    .iter()
+                    .map(|app| app.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
         }
     }
 
@@ -99,20 +126,25 @@ impl InstalledApp {
             Self::Desktop(app) => app
                 .downcast_ref::<DesktopAppInfo>()
                 .and_then(|entry| entry.filename()),
-            Self::Cli(app) => Some(app.executable.clone()),
+            Self::Cli(_) => None,
         }
     }
 
     fn search_key(&self) -> String {
         let executable = match self {
-            Self::Desktop(app) => app.executable(),
-            Self::Cli(app) => app.executable.clone(),
+            Self::Desktop(app) => app.executable().display().to_string(),
+            Self::Cli(group) => group
+                .binaries
+                .iter()
+                .map(|app| app.executable.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
         };
         format!(
             "{} {} {} {}",
             self.name(),
             self.identifier(),
-            executable.display(),
+            executable,
             self.summary().unwrap_or_default()
         )
         .to_lowercase()
@@ -121,7 +153,7 @@ impl InstalledApp {
     fn uninstall_command(&self) -> Option<String> {
         match self {
             Self::Desktop(app) => uninstall_command::for_app(app),
-            Self::Cli(app) => uninstall_command::for_executable(&app.executable),
+            Self::Cli(group) => group.uninstall_command.clone(),
         }
     }
 }
@@ -141,7 +173,7 @@ fn rebuild_list(
     while let Some(row) = list.row_at_index(0) {
         list.remove(&row);
     }
-    description.set_text(&kind.description(apps.len()));
+    description.set_text(&kind.description(apps));
     *keys.borrow_mut() = apps.iter().map(InstalledApp::search_key).collect();
     for app in apps {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -177,6 +209,25 @@ fn rebuild_list(
             text.append(&summary);
         }
         text.append(&id);
+        if let InstalledApp::Cli(group) = app {
+            let binaries = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            for binary in &group.binaries {
+                let label = gtk::Label::new(Some(&format!(
+                    "{}\n{}",
+                    binary.name,
+                    binary.executable.display()
+                )));
+                label.set_xalign(0.0);
+                label.set_selectable(true);
+                label.set_wrap(true);
+                label.add_css_class("monospace");
+                label.set_margin_top(4);
+                binaries.append(&label);
+            }
+            let expander = gtk::Expander::new(Some(&format!("{} binaries", group.binaries.len())));
+            expander.set_child(Some(&binaries));
+            text.append(&expander);
+        }
         row.append(&text);
         list.append(&row);
     }
@@ -231,7 +282,7 @@ fn build_page(kind: AppKind) -> gtk::Box {
     let search = gtk::SearchEntry::new();
     search.set_placeholder_text(Some(match kind {
         AppKind::Desktop => "Search applications",
-        AppKind::Cli => "Search commands or paths",
+        AppKind::Cli => "Search packages, commands or paths",
     }));
     content.append(&search);
     let list = gtk::ListBox::new();
@@ -274,11 +325,8 @@ fn build_page(kind: AppKind) -> gtk::Box {
     content.append(&notice);
 
     // Shared between the selection, filter and refresh callbacks.
-    let apps = Rc::new(RefCell::new(Vec::new()));
-    let keys = Rc::new(RefCell::new(Vec::new()));
-    let initial = kind.load();
-    rebuild_list(&list, &initial, &keys, &description, kind);
-    *apps.borrow_mut() = initial;
+    let apps: Shared<Vec<InstalledApp>> = Rc::new(RefCell::new(Vec::new()));
+    let keys: Shared<Vec<String>> = Rc::new(RefCell::new(Vec::new()));
     let filter_search = search.clone();
     let filter_keys = keys.clone();
     list.set_filter_func(move |row| {
@@ -342,20 +390,32 @@ fn build_page(kind: AppKind) -> gtk::Box {
     let refresh_copy = copy.clone();
     let refresh_file = file.clone();
     copy.connect_clicked(move |_| command.clipboard().set_text(&command.text()));
-    refresh.connect_clicked(move |_| {
-        let apps = kind.load();
-        refresh_list.unselect_all();
-        rebuild_list(
-            &refresh_list,
-            &apps,
-            &refresh_keys,
-            &refresh_description,
-            kind,
-        );
-        *refresh_apps.borrow_mut() = apps;
-        refresh_command.set_text("Select an application");
-        refresh_copy.set_sensitive(false);
-        refresh_file.set_visible(false);
+    refresh.connect_clicked(move |refresh| {
+        refresh.set_sensitive(false);
+        refresh_description.set_text("Loading…");
+        let refresh = refresh.clone();
+        let list = refresh_list.clone();
+        let apps = refresh_apps.clone();
+        let keys = refresh_keys.clone();
+        let description = refresh_description.clone();
+        let command = refresh_command.clone();
+        let copy = refresh_copy.clone();
+        let file = refresh_file.clone();
+        glib::MainContext::default().spawn_local(async move {
+            match kind.load().await {
+                Some(loaded) => {
+                    list.unselect_all();
+                    rebuild_list(&list, &loaded, &keys, &description, kind);
+                    *apps.borrow_mut() = loaded;
+                    command.set_text("Select an application");
+                    copy.set_sensitive(false);
+                    file.set_visible(false);
+                }
+                None => description.set_text("Could not load CLI commands. Try refreshing."),
+            }
+            refresh.set_sensitive(true);
+        });
     });
+    refresh.emit_clicked();
     content
 }

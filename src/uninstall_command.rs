@@ -1,20 +1,26 @@
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use gio_unix::DesktopAppInfo;
 use gtk4::gio;
 use gtk4::gio::prelude::AppInfoExt;
 use gtk4::glib::{self, object::Cast};
 
+use crate::package_owner::PackageOwner;
+
 pub(crate) fn for_app(app: &gio::AppInfo) -> Option<String> {
     for_app_with_owner(app, owner_command)
 }
 
-/// Looks up the package owning a CLI executable or its resolved symlink target.
-pub(crate) fn for_executable(executable: &Path) -> Option<String> {
-    lookup_path(executable, &mut owner_command)
+/// Resolves a desktop application's executable, skipping shared launchers.
+pub(crate) fn desktop_executable(app: &gio::AppInfo) -> Option<PathBuf> {
+    let launch = Launch::parse(&app.commandline()?)?;
+    if is_shared_launcher(&launch.executable) {
+        return None;
+    }
+    glib::find_program_in_path(launch.executable)
 }
 
 fn for_app_with_owner(
@@ -77,23 +83,7 @@ fn for_app_with_owner(
     }
     let executable = launch?.executable;
     // A shared interpreter or launcher does not identify the application's package.
-    if matches!(
-        executable.file_name()?.to_str()?,
-        "env"
-            | "sh"
-            | "bash"
-            | "dash"
-            | "zsh"
-            | "fish"
-            | "python"
-            | "python3"
-            | "node"
-            | "perl"
-            | "ruby"
-            | "steam"
-            | "flatpak"
-            | "snap"
-    ) {
+    if is_shared_launcher(&executable) {
         return None;
     }
     let Some(executable) = glib::find_program_in_path(executable) else {
@@ -105,6 +95,30 @@ fn for_app_with_owner(
         let desktop_file = desktop.filename()?;
         bundle_trash_command(&resolved, &desktop_file)
     })
+}
+
+fn is_shared_launcher(executable: &Path) -> bool {
+    matches!(
+        executable.file_name().and_then(OsStr::to_str),
+        Some(
+            "env"
+                | "sh"
+                | "bash"
+                | "dash"
+                | "zsh"
+                | "fish"
+                | "python"
+                | "python3"
+                | "node"
+                | "perl"
+                | "ruby"
+                | "steam"
+                | "flatpak"
+                | "snap"
+                | "wine"
+                | "wine64"
+        )
+    )
 }
 
 // A dead wine entry leaves only its launchers behind. Wine gives every app
@@ -354,49 +368,9 @@ impl Launch {
 }
 
 fn owner_command(filename: &Path) -> Option<String> {
-    // Only package ownership queries are executed. Uninstall commands remain text.
-    for (program, args, prefix) in [
-        ("pacman", &["-Qoq", "--"][..], "sudo pacman -R --"),
-        ("dpkg-query", &["-S", "--"][..], "sudo apt remove --"),
-        (
-            "rpm",
-            &["-qf", "--queryformat", "%{NAME}", "--"][..],
-            "sudo rpm -e --",
-        ),
-    ] {
-        let Ok(output) = Command::new(program)
-            .args(args)
-            .arg(filename)
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .output()
-        else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let output = String::from_utf8_lossy(&output.stdout);
-        let mut packages = Vec::new();
-        for line in output.lines() {
-            let package = if program == "dpkg-query" {
-                line.split_once(": ")?.0
-            } else {
-                line.trim()
-            };
-            if package.is_empty()
-                || package.starts_with('-')
-                || package.chars().any(char::is_control)
-            {
-                return None;
-            }
-            packages.push(shell_quote(package));
-        }
-        if !packages.is_empty() {
-            return Some(format!("{prefix} {}", packages.join(" ")));
-        }
-    }
-    None
+    PackageOwner::lookup(&BTreeSet::from([filename.to_path_buf()]))
+        .remove(filename)
+        .map(|owner| owner.command)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -421,7 +395,10 @@ mod tests {
     use gio_unix::DesktopAppInfo;
     use gtk4::glib::{KeyFile, object::Cast};
 
-    use super::{Launch, dead_wine_launcher, for_app_with_owner, lookup_path, shell_quote};
+    use super::{
+        Launch, dead_wine_launcher, desktop_executable, for_app_with_owner, lookup_path,
+        shell_quote,
+    };
 
     struct TestBundle {
         root: PathBuf,
@@ -543,6 +520,20 @@ mod tests {
             for_app_with_owner(app.upcast_ref(), true_owner).as_deref(),
             Some("sudo pacman -R -- test-app")
         );
+    }
+
+    #[test]
+    fn desktop_exclusion_resolves_env_without_hiding_shared_interpreters() {
+        assert_eq!(
+            desktop_executable(desktop("env EXAMPLE=1 true %U").upcast_ref()),
+            gtk4::glib::find_program_in_path("true"),
+        );
+        for command in ["sh -c true", "python3 example.py", "wine example.exe"] {
+            assert!(
+                desktop_executable(desktop(command).upcast_ref()).is_none(),
+                "shared launcher must remain available in CLI apps: {command}"
+            );
+        }
     }
 
     #[test]
